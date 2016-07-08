@@ -1,0 +1,28 @@
+inactive_user.settings:
+  type: mapping
+  label: Settings
+  mapping:
+    inactive_user_notify_admin:
+      type: integer
+    inactive_user_notify:
+      type: integer
+    inactive_user_auto_block_warn:
+      type: integer
+    inactive_user_auto_block:
+      type: integer
+    inactive_user_notify_block:
+      type: integer
+    inactive_user_notify_block_admin:
+      type: integer
+    inactive_user_auto_delete_warn:
+      type: integer
+    inactive_user_auto_delete:
+      type: integer
+    inactive_user_preserve_content:
+      type: integer
+    inactive_user_notify_delete:
+      type: integer
+    inactive_user_notify_delete_admin:
+      type: integer
+    inactive_user_timestamp:
+      type: string

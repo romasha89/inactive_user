@@ -1,0 +1,9 @@
+name: 'Inactive User'
+description: 'Automatic handling of inactive users.'
+core: 8.x
+version: 8.x-1.0-dev
+project: inactive_user
+datestamp: '1463920146'
+type: module
+interface translation project: inactive_user
+interface translation server pattern: modules/contrib/inactive_user/translations/%language.po

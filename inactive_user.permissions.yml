@@ -1,0 +1,4 @@
+inactive_user change_settings:
+    title: 'Inactive User configuration access'
+    description: 'Allow access to Inactive User configuration page'
+    restrict access: false

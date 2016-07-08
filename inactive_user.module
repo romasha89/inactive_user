@@ -1,0 +1,686 @@
+<?php
+
+/**
+ * @file
+ * The inactive user module controls inactive users.
+ *
+ * The inactive user module sends mails to inactive users.
+ * The user can configure the time after Drupal sends mails.
+ */
+
+use Drupal\Core\Url;
+use Drupal\Core\Link;
+use Drupal\Core\Logger\RfcLogLevel;
+use Drupal\user\Entity\User;
+use Drupal\User\UserInterface;
+
+/**
+ * Cancel User Profile via User ID.
+ *
+ * @param int $user_id
+ *    User ID.
+ */
+function inactive_user_user_cancel($user_id) {
+  $db = \Drupal::database();
+  $db->delete('inactive_users')
+    ->condition('uid', $user_id)
+    ->execute();
+}
+
+/**
+ * Implements hook_cron().
+ */
+function inactive_user_cron() {
+  // Only check once every almost-day,
+  // so we slide around the clock and don't overload the server.
+  if ((REQUEST_TIME - \Drupal::config('inactive_user.settings')->get('inactive_user_timestamp')) >= 86100) {
+    \Drupal::configFactory()
+      ->getEditable('inactive_user.settings')
+      ->set('inactive_user_timestamp', REQUEST_TIME)
+      ->save();
+    $user_list = '';
+
+    $db = \Drupal::database();
+    // Reset notifications if recent user activity.
+    $results = $db->query('SELECT uid FROM {inactive_users} WHERE uid <> :one', array(':one' => 1));
+    $results->allowRowCount = TRUE;
+    if ($results->rowCount()) {
+      foreach ($results as $record) {
+        $u = \Drupal::entityQuery('user')
+          ->condition('uid', $record->uid)
+          ->execute();
+
+        $user = User::loadMultiple($u);
+        $user = array_pop($user);
+        if (empty($user)) {
+          inactive_user_user_cancel($record->uid);
+          continue;
+        }
+        if ($user->getLastAccessedTime() > REQUEST_TIME - 604800) {
+          // User activity in last week, remove from inactivity table.
+          inactive_user_user_cancel($user->id());
+          $url = Url::fromRoute('entity.user.edit_form', array('user' => $record->uid));
+          $link = Link::fromTextAndUrl(t('edit user'), $url)->toString();
+          $message = 'Recent user activity: %user removed from inactivity list.';
+
+          \Drupal::logger('user')->log(RfcLogLevel::NOTICE, $message, array(
+            '%user' => $user->getUsername(),
+            'link' => $link,
+          ));
+        }
+      }
+    }
+    // Notify administrator of inactive user accounts.
+    if ($notify_time = \Drupal::config('inactive_user.settings')->get('inactive_user_notify_admin')) {
+      $query = \Drupal::entityQuery('user')
+        ->condition(\Drupal::entityQuery('user')->orConditionGroup()
+            ->condition(\Drupal::entityQuery('user')->andConditionGroup()
+              ->condition('access', 0, '<>')
+              ->condition('login', 0, '<>')
+              ->condition('access', REQUEST_TIME - $notify_time, '<'))
+            ->condition(\Drupal::entityQuery('user')->andConditionGroup()
+              ->condition('login', 0)
+              ->condition('created', REQUEST_TIME - $notify_time, '<'))
+        )
+        ->condition('uid', 1, '<>');
+      $query->addTag('inactive_user');
+      $query->addTag('notify_admin');
+
+      $ids = $query->execute();
+      $results = User::loadMultiple($ids);
+      foreach ($results as $user) {
+        // Has the admin been notified?
+        $admin_notify = $db->select('inactive_users', 'ia')
+          ->fields('ia', array('uid'))
+          ->condition('ia.uid', $user->id())
+          ->condition('ia.notified_admin', 1);
+        $admin_notify_results = $admin_notify->countQuery()
+          ->execute()
+          ->fetchField();
+
+        if ($user->id() && !$admin_notify_results && ($user->get('access')->value < (REQUEST_TIME - $notify_time))) {
+          $query = $db->update('inactive_users')
+            ->fields(array('notified_admin' => 1))
+            ->condition('uid', $user->id())
+            ->execute();
+
+          // Update queries return rows updated.
+          if (!$query) {
+            // No rows updated, must create a new row.
+            $db->insert('inactive_users')
+              ->fields(array('uid' => $user->id(), 'notified_admin' => 1))
+              ->execute();
+          }
+          $user_list .= $user->getDisplayName() . " (" . $user->getEmail() . ") last active on " . format_date($user->get('access')->value, 'large') . ".\n";
+        }
+      }
+
+      if (!empty($user_list)) {
+        _inactive_user_mail(
+          t('[@sitename] Inactive users', array(
+            '@sitename' => \Drupal::config('system.site')->get('name'),
+          )),
+          _inactive_user_mail_text('notify_admin_text'), $notify_time, NULL, $user_list);
+        $user_list = '';
+      }
+    }
+
+    // Notify users that their account has been inactive.
+    if ($notify_time = \Drupal::config('inactive_user.settings')->get('inactive_user_notify')) {
+      $query = \Drupal::entityQuery('user')
+        ->condition(\Drupal::entityQuery('user')->orConditionGroup()
+            ->condition(\Drupal::entityQuery('user')->andConditionGroup()
+              ->condition('access', 0, '<>')
+              ->condition('login', 0, '<>')
+              ->condition('access', REQUEST_TIME - $notify_time, '<'))
+            ->condition(\Drupal::entityQuery('user')->andConditionGroup()
+              ->condition('login', 0)
+              ->condition('created', REQUEST_TIME - $notify_time, '<'))
+        )
+        ->condition('status', 0, '<>')
+        ->condition('uid', 1, '<>');
+
+      $query->addTag('inactive_user');
+      $query->addTag('notify_users_inactive_account');
+
+      $ids = $query->execute();
+      $results = User::loadMultiple($ids);
+      foreach ($results as $user) {
+        $notified_user = $db->select('inactive_users', 'ia')
+          ->fields('ia', array('uid'))
+          ->condition('ia.notified_user', 1)
+          ->condition('ia.uid', $user->id());
+        $notified_user_results = $notified_user->countQuery()
+          ->execute()
+          ->fetchField();
+
+        if ($user->id() && !$notified_user_results && ($user->get('access')->value < (REQUEST_TIME - $notify_time))) {
+          $query = $db->update('inactive_users')
+            ->fields(array('notified_user' => 1))
+            ->condition('uid', $user->id())->execute();
+
+          if (!$query) {
+            $db->insert('inactive_users')->fields(array(
+              'uid' => $user->id(),
+              'notified_user' => 1,
+            ))->execute();
+          }
+
+          _inactive_user_mail(
+            t('[@sitename] Account inactivity', array(
+              '@sitename' => \Drupal::config('system.site')->get('name'),
+            )),
+            _inactive_user_get_text_from_config('inactive_user_notify_text', 'notify_text'), $notify_time, $user, NULL
+          );
+
+          $url = Url::fromRoute('entity.user.edit_form', array('user' => $user->id()));
+          $link = Link::fromTextAndUrl(t('edit user'), $url)->toString();
+          $message = 'User %user notified of inactivity.';
+
+          \Drupal::logger('user')->log(RfcLogLevel::INFO, $message, array(
+            '%user' => $user->get('name')->value,
+            'link' => $link,
+          ));
+        }
+      }
+    }
+
+    // Warn users when they are about to be blocked.
+    // This query asks for all users who are not user 1, that have logged in
+    // at least once, but not since the request_time minus the interval
+    // represented by the block time plus the warning lead time or
+    // all users who haven't logged in but were created since the
+    // request time minus the interval represented by the block time
+    // plus the warning lead time.
+    if (($warn_time = \Drupal::config('inactive_user.settings')
+        ->get('inactive_user_auto_block_warn')) &&
+      ($block_time = \Drupal::config('inactive_user.settings')
+        ->get('inactive_user_auto_block'))
+    ) {
+      $query = \Drupal::entityQuery('user')
+        ->condition(\Drupal::entityQuery('user')->orConditionGroup()
+            ->condition(\Drupal::entityQuery('user')->andConditionGroup()
+              ->condition('access', 0, '<>')
+              ->condition('login', 0, '<>')
+              ->condition('access', REQUEST_TIME - $block_time + $warn_time, '<'))
+            ->condition(\Drupal::entityQuery('user')->andConditionGroup()
+              ->condition('login', 0)
+              ->condition('created', REQUEST_TIME - $block_time + $warn_time, '<'))
+        )
+        ->condition('status', 0, '<>')
+        ->condition('uid', 1, '<>');
+
+      $query->addTag('inactive_user');
+      $query->addTag('warn_users_blocked');
+
+      $ids = $query->execute();
+      $results = User::loadMultiple($ids);
+      foreach ($results as $user) {
+        $warned_user = $db->select('inactive_users', 'ia')
+          ->fields('ia', array('uid'))
+          ->condition('ia.warned_user_block_timestamp', 0, '>')
+          ->condition('ia.uid', $user->id());
+        $warned_user_results = $warned_user->countQuery()
+          ->execute()
+          ->fetchField();
+
+        if ($user->id() && !$warned_user_results && ($user->get('access')->value < (REQUEST_TIME - $block_time + $warn_time))) {
+          $query = $db->update('inactive_users')
+            ->fields(array('warned_user_block_timestamp' => REQUEST_TIME + $warn_time))
+            ->condition('uid', $user->id())->execute();
+
+          // Update statements return rows updated.
+          if (!$query) {
+            $db->insert('inactive_users')
+              ->fields(array(
+                'uid' => $user->id(),
+                'warned_user_block_timestamp' => REQUEST_TIME + $warn_time,
+              ))
+              ->execute();
+          }
+
+          _inactive_user_mail(
+            t('[@sitename] Account inactivity', array(
+              '@sitename' => \Drupal::config('system.site')->get('name'),
+            )),
+            _inactive_user_get_text_from_config('inactive_user_block_warn_text', 'block_warn_text'), $warn_time, $user, NULL
+          );
+
+          $url = Url::fromRoute('entity.user.edit_form', array('user' => $user->id()));
+          $link = Link::fromTextAndUrl(t('edit user'), $url)->toString();
+
+          $message = 'User %user warned, will be blocked due to inactivity.';
+          \Drupal::logger('user')->log(RfcLogLevel::NOTICE, $message, array(
+            '%user' => $user->get('name')->value,
+            'link' => $link,
+          ));
+        }
+      }
+    }
+
+    // Automatically block users.
+    if ($block_time = \Drupal::config('inactive_user.settings')->get('inactive_user_auto_block')) {
+      $query = \Drupal::entityQuery('user')
+        ->condition(\Drupal::entityQuery('user')->orConditionGroup()
+            ->condition(\Drupal::entityQuery('user')->andConditionGroup()
+              ->condition('access', 0, '<>')
+              ->condition('login', 0, '<>')
+              ->condition('access', REQUEST_TIME - $block_time, '<'))
+            ->condition(\Drupal::entityQuery('user')->andConditionGroup()
+              ->condition('login', 0)
+              ->condition('created', REQUEST_TIME - $block_time, '<'))
+        )
+        ->condition('status', 0, '<>')
+        ->condition('uid', 1, '<>');
+
+      $query->addTag('inactive_user');
+      $query->addTag('block_users');
+
+      $ids = $query->execute();
+      $results = User::loadMultiple($ids);
+      foreach ($results as $user) {
+        // Don't block user yet if we sent a warning and it hasn't expired.
+        $notexpired_user = $db->select('inactive_users', 'ia')
+          ->fields('ia', array('uid'))
+          ->condition('ia.warned_user_block_timestamp', REQUEST_TIME, '>')
+          ->condition('ia.uid', $user->id());
+        $notexpired_user_results = $notexpired_user->countQuery()
+          ->execute()
+          ->fetchField();
+
+        if ($user->id() && $notexpired_user_results && ($user->get('access')->value < (REQUEST_TIME - $block_time))) {
+          // Notify user.
+          if (\Drupal::config('inactive_user.settings')->get('inactive_user_notify_block')) {
+            if (!$db->select('inactive_users', 'ia')
+              ->fields('ia', array('uid'))
+              ->condition('notified_user_block', 1)
+              ->condition('ia.uid', $user->id())
+              ->countQuery()
+              ->execute()
+              ->fetchField()
+            ) {
+              $query = $db->update('inactive_users')
+                ->fields(array('notified_user_block' => 1))
+                ->condition('uid', $user->id())->execute();
+              // Update statements return rows altered.
+              if (!$query) {
+                $db->insert('inactive_users')
+                  ->fields(array(
+                    'uid' => $user->id(),
+                    'notified_user_block' => 1,
+                  ))
+                  ->execute();
+              }
+              // Block user, if not blocked already.
+              if (!$user->isBlocked()) {
+                $user->block()->save();
+              }
+
+              _inactive_user_mail(
+                t('[@sitename] Account blocked due to inactivity', array(
+                  '@sitename' => \Drupal::config('system.site')->get('name'),
+                )),
+                _inactive_user_get_text_from_config('inactive_user_block_notify_text', 'block_notify_text'), $block_time, $user, NULL
+              );
+
+              $url = Url::fromRoute('entity.user.edit_form', array('user' => $user->id()));
+              $link = Link::fromTextAndUrl(t('edit user'), $url)->toString();
+              $message = 'User %user blocked due to inactivity.';
+
+              \Drupal::logger('user')->log(RfcLogLevel::NOTICE, $message, array(
+                '%user' => $user->get('name')->value,
+                'link' => $link,
+              ));
+            }
+          }
+
+          // Notify admin.
+          if (\Drupal::config('inactive_user.settings')->get('inactive_user_notify_block_admin')) {
+            if (!$db->select('inactive_users', 'ia')
+              ->fields('ia', array('uid'))
+              ->condition('notified_admin_block', 1)
+              ->condition('ia.uid', $user->id())
+              ->countQuery()
+              ->execute()
+              ->fetchField()
+            ) {
+              $query = $db->update('inactive_users')
+                ->fields(array('notified_admin_block' => 1))
+                ->condition('uid', $user->id())->execute();
+
+              // Update statements return rows altered.
+              if (!$query) {
+                $db->insert('inactive_users')
+                  ->fields(array(
+                    'uid' => $user->id(),
+                    'notified_admin_block' => 1,
+                  ))
+                  ->execute();
+              }
+              $user_list .= $user->getDisplayName() . " (" . $user->getEmail() . ") last active on " .
+                \Drupal::service('date.formatter')->format($user->get('access')->value, 'large') . ".\n";
+            }
+          }
+        }
+        if (!empty($user_list)) {
+          _inactive_user_mail(
+            t('[@sitename] Blocked users', array(
+              '@sitename' => \Drupal::config('system.site')->get('name'),
+            )),
+            _inactive_user_get_text_from_config('block_notify_admin_text', 'block_notify_admin_text'), $block_time, NULL, $user_list
+          );
+          $user_list = '';
+        }
+      }
+    }
+
+    // Warn users when they are about to be deleted.
+    if (($warn_time = \Drupal::config('inactive_user.settings')
+        ->get('inactive_user_auto_delete_warn')) &&
+      ($delete_time = \Drupal::config('inactive_user.settings')
+        ->get('inactive_user_auto_delete'))
+    ) {
+      $query = \Drupal::entityQuery('user')
+        ->condition(\Drupal::entityQuery('user')->orConditionGroup()
+            ->condition(\Drupal::entityQuery('user')->andConditionGroup()
+              ->condition('access', 0, '<>')
+              ->condition('login', 0, '<>')
+              ->condition('access', REQUEST_TIME - $delete_time + $warn_time, '<'))
+            ->condition(\Drupal::entityQuery('user')->andConditionGroup()
+              ->condition('login', 0)
+              ->condition('created', REQUEST_TIME - $delete_time + $warn_time, '<'))
+        )
+        ->condition('uid', 1, '<>');
+
+      $query->addTag('inactive_user');
+      $query->addTag('warn_users_deleted');
+
+      $ids = $query->execute();
+      $results = User::loadMultiple($ids);
+      foreach ($results as $user) {
+        $warned_user = $db->select('inactive_users', 'ia')
+          ->fields('ia', array('uid'))
+          ->condition('ia.warned_user_delete_timestamp', 0, '>')
+          ->condition('ia.uid', $user->id());
+        $warned_user_results = $warned_user->countQuery()
+          ->execute()
+          ->fetchField();
+
+        if ($user->id() && !$warned_user_results && ($user->get('access')->value < (REQUEST_TIME - $warn_time))) {
+
+          if (\Drupal::config('inactive_user.settings')
+              ->get('inactive_user_preserve_content') && _inactive_user_with_content($user->id())
+          ) {
+            $protected = 1;
+          }
+          else {
+            $protected = 0;
+          }
+
+          // The db_update function returns the number of rows altered.
+          $query = $db->update('inactive_users')
+            ->fields(array(
+              'warned_user_delete_timestamp' => REQUEST_TIME + $warn_time,
+              'protected' => $protected,
+            ))
+            ->condition('uid', $user->id())->execute();
+
+          if (!$query) {
+            $db->insert('inactive_users')->fields(
+              array(
+                'uid' => $user->id(),
+                'warned_user_delete_timestamp' => REQUEST_TIME + $warn_time,
+                'protected' => $protected,
+              ))->execute();
+          }
+          if (!$protected) {
+            _inactive_user_mail(
+              t('[@sitename] Account inactivity', array(
+                '@sitename' => \Drupal::config('system.site')->get('name'),
+              )),
+              _inactive_user_get_text_from_config('inactive_user_delete_warn_text', 'delete_warn_text'), $warn_time, $user, NULL
+            );
+
+            $url = Url::fromRoute('entity.user.edit_form', array('user' => $user->id()));
+            $link = Link::fromTextAndUrl(t('edit user'), $url)->toString();
+            $message = 'User %user warned, will be deleted due to inactivity.';
+
+            \Drupal::logger('user')->log(RfcLogLevel::NOTICE, $message, array(
+              '%user' => $user->get('mail')->value,
+              'link' => $link,
+            ));
+          }
+        }
+      }
+    }
+
+    // Automatically delete users.
+    if ($delete_time = \Drupal::config('inactive_user.settings')->get('inactive_user_auto_delete')) {
+      $query = \Drupal::entityQuery('user')
+        ->condition(\Drupal::entityQuery('user')->orConditionGroup()
+            ->condition(\Drupal::entityQuery('user')->andConditionGroup()
+              ->condition('access', 0, '<>')
+              ->condition('login', 0, '<>')
+              ->condition('access', REQUEST_TIME - $delete_time, '<'))
+            ->condition(\Drupal::entityQuery('user')->andConditionGroup()
+              ->condition('login', 0)
+              ->condition('created', REQUEST_TIME - $delete_time, '<'))
+        )
+        ->condition('uid', 1, '<>');
+
+      $query->addTag('inactive_user');
+      $query->addTag('delete_users');
+
+      $ids = $query->execute();
+      $results = User::loadMultiple($ids);
+      foreach ($results as $user) {
+        $deleteable_user = $db->select('inactive_users', 'ia')
+          ->fields('ia', array('uid'))
+          ->condition('ia.warned_user_delete_timestamp', REQUEST_TIME, '<')
+          ->condition('ia.uid', $user->id())
+          ->condition('ia.protected', 1, '<>');
+        $deleteable_user_results = $deleteable_user->countQuery()
+          ->execute()
+          ->fetchField();
+
+        if ($user->id() && (((\Drupal::config('inactive_user.settings')
+                  ->get('inactive_user_auto_delete_warn') > 0) &&
+              !$deleteable_user_results) || (!\Drupal::config('inactive_user.settings')
+              ->get('inactive_user_auto_delete_warn'))) &&
+          ($user->get('access')->value < (REQUEST_TIME - $delete_time))
+        ) {
+
+          $is_protected = (\Drupal::config('inactive_user.settings')->get('inactive_user_preserve_content') && _inactive_user_with_content($user->id())) ? 1 : 0;
+          if ($is_protected == 1) {
+            // This is a protected user, mark as such.
+            $query = $db->update('inactive_users')
+              ->fields(array('protected' => $is_protected))
+              ->condition('uid', $user->id())->execute();
+          }
+          else {
+            // Close Sessions.
+            Drupal::service('session_manager')->delete($user->id());
+
+            if (\Drupal::config('inactive_user.settings')->get('inactive_user_notify_delete')) {
+              _inactive_user_mail(
+                t('[@sitename] Account removed', array(
+                  '@sitename' => \Drupal::config('system.site')->get('name'),
+                )),
+                _inactive_user_get_text_from_config('inactive_user_delete_notify_text', 'delete_notify_text'), $delete_time, $user, NULL
+              );
+            }
+            if (\Drupal::config('inactive_user.settings')->get('inactive_user_notify_delete_admin')) {
+              $user_list .= $user->getDisplayName() . " (" . $user->getEmail() . ") last active on " .
+                \Drupal::service('date.formatter')->format($user->get('access')->value, 'large') . ".\n";
+            }
+            \Drupal::logger('user')
+              ->notice('user %user deleted due to inactivity', array('%user' => $user->get('name')->value));
+
+            \Drupal::moduleHandler()->invokeAll('inactive_user', array($user));
+            // Remove record about inactive user.
+            inactive_user_user_cancel($user->id());
+            // Delete the user.
+            User::load($user->id())->delete();
+          }
+        }
+      }
+      if (!empty($user_list)) {
+        _inactive_user_mail(
+          t('[@sitename] Deleted accounts', array(
+            '@sitename' => \Drupal::config('system.site')->get('name'),
+          )),
+          _inactive_user_get_text_from_config('delete_notify_admin_text', 'delete_notify_admin_text'), $delete_time, NULL, $user_list
+        );
+        unset($user_list);
+      }
+    }
+  }
+}
+
+/**
+ * Get administrator e-mail address(es).
+ */
+function _inactive_user_admin_mail() {
+  $ids = \Drupal::entityQuery('user')->condition('uid', 1)->execute();
+  $users = User::loadMultiple($ids);
+  $mail = array_pop($users)->getEmail();
+  if (!$result = \Drupal::config('inactive_user.settings')->get('inactive_user_admin_email')) {
+    if (!$result = \Drupal::config('system.site')->get('mail')) {
+      $result = $mail;
+    }
+  }
+
+  return $result;
+}
+
+/**
+ * Implements hook_mail().
+ */
+function inactive_user_mail($key, &$message, $params) {
+  $message['subject'] = $params['subject'];
+  $message['body'][] = $params['message'];
+}
+
+/**
+ * Wrapper for user_mail.
+ */
+function _inactive_user_mail($subject, $message, $period, UserInterface $user = NULL, $user_list = NULL) {
+  global $base_url;
+  $variables = array();
+  $site_url = Link::fromTextAndUrl($base_url, Url::fromUri($base_url))->toRenderable();
+  if ($user_list) {
+    $to = _inactive_user_admin_mail();
+    $variables = array(
+      '%period' => \Drupal::service('date.formatter')->formatInterval($period),
+      '%sitename' => \Drupal::config('system.site')->get('name'),
+      '%siteurl' => render($site_url)->__toString(),
+      '%userlist' => $user_list,
+    );
+  }
+  elseif (isset($user->get('uid')->value)) {
+    $to = $user->getEmail();
+    $variables = array(
+      '%username' => $user->getDisplayName(),
+      '%useremail' => $user->getEmail(),
+      '%lastaccess' => empty($user->get('access')->value) ? t('never') : \Drupal::service('date.formatter')
+        ->format($user->get('access')->value, 'custom', 'M d, Y'),
+      '%period' => \Drupal::service('date.formatter')->formatInterval($period),
+      '%sitename' => \Drupal::config('system.site')->get('name'),
+      '%siteurl' => render($site_url)->__toString(),
+    );
+
+  }
+  if (isset($to)) {
+    $from = \Drupal::config('system.site')->get('mail', ini_get('sendmail_from'));
+    $headers = array(
+      'Reply-to' => $from,
+      'Return-path' => "<$from>",
+      'Errors-to' => $from,
+    );
+    $recipients = explode(',', $to);
+    foreach ($recipients as $recipient) {
+      $recipient = trim($recipient);
+      $params = array(
+        'subject' => $subject,
+        'message' => strtr($message, $variables),
+        'headers' => $headers,
+      );
+      $users = \Drupal::entityTypeManager()->getStorage('user')->loadByProperties(array('mail' => $recipient));
+      $user = array_shift($users);
+      $language = isset($user->get('uid')->value) ? $user->getPreferredLangcode() : \Drupal::service('language.default')->get();
+
+      $mailManager = \Drupal::service('plugin.manager.mail');
+      $mailManager->mail('inactive_user', 'inactive_user_notice', $recipient, $language, $params, $from, TRUE);
+    }
+  }
+}
+
+/**
+ * Some default e-mail notification strings.
+ */
+function _inactive_user_mail_text($message) {
+  switch ($message) {
+    case 'notify_text':
+      return t("Hello %username,\n\n  We haven't seen you at %sitename since %lastaccess, and we miss you!  Please come back and visit us soon at %siteurl.\n\nSincerely,\n  %sitename team");
+
+    case 'notify_admin_text':
+      return t("Hello,\n\n  This automatic notification is to inform you that the following users haven't been seen on %sitename for more than %period:\n\n%userlist");
+
+    case 'block_warn_text':
+      return t("Hello %username,\n\n  We haven't seen you at %sitename since %lastaccess, and we miss you!  This automatic message is to warn you that your account will be disabled in %period unless you come back and visit us before that time.\n\n  Please visit us at %siteurl.\n\nSincerely,\n  %sitename team");
+
+    case 'block_notify_text':
+      return t("Hello %username,\n\n  This automatic message is to notify you that your account on %sitename has been automatically disabled due to no activity for more than %period.\n\n  Please visit us at %siteurl to have your account re-enabled.\n\nSincerely,\n  %sitename team");
+
+    case 'block_notify_admin_text':
+      return t("Hello,\n\n  This automatic notification is to inform you that the following users have been automatically blocked due to inactivity on %sitename for more than %period:\n\n%userlist");
+
+    case 'delete_warn_text':
+      return t("Hello %username,\n\n  We haven't seen you at %sitename since %lastaccess, and we miss you!  This automatic message is to warn you that your account will be completely removed in %period unless you come back and visit us before that time.\n\n  Please visit us at %siteurl.\n\nSincerely,\n  %sitename team");
+
+    case 'delete_notify_text':
+      return t("Hello %username,\n\n  This automatic message is to notify you that your account on %sitename has been automatically removed due to no activity for more than %period.\n\n  Please visit us at %siteurl if you would like to create a new account.\n\nSincerely,\n  %sitename team");
+
+    case 'delete_notify_admin_text':
+      return t("Hello,\n\n  This automatic notification is to inform you that the following users have been automatically deleted due to inactivity on %sitename for more than %period:\n\n%userlist");
+  }
+}
+
+/**
+ * Get text from config entity. If null - get default value.
+ *
+ * @param string $config_name
+ *    Config name.
+ * @param string $default_text
+ *    Default text id.
+ *
+ * @return \Drupal\Core\StringTranslation\TranslatableMarkup|mixed|null|string
+ *    Value string.
+ */
+function _inactive_user_get_text_from_config($config_name, $default_text = NULL) {
+  return \Drupal::config('inactive_user.settings')->get($config_name) ?
+    \Drupal::config('inactive_user.settings')->get($config_name) :
+    _inactive_user_mail_text($default_text);
+}
+
+/**
+ * Check allow to protect such users from deletion.
+ *
+ * @param int $uid
+ *    User ID.
+ *
+ * @return bool
+ *    Returns TRUE if the user has ever created a node or a comment.
+ */
+function _inactive_user_with_content($uid) {
+  $user_has_nodes = \Drupal::entityQuery('node')
+    ->condition('uid', $uid)
+    ->count()
+    ->execute();
+  $user_has_comments = \Drupal::entityQuery('comment')
+    ->condition('uid', $uid)
+    ->count()
+    ->execute();
+
+  return (($user_has_nodes + $user_has_comments) > 0) ? TRUE : FALSE;
+}

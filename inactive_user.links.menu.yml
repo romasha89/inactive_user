@@ -1,0 +1,7 @@
+inactive_user.inactive_user_form:
+  title: 'Inactive User Settings'
+  route_name: inactive_user.settings
+  description: 'Set rules and contact templates for inactive users.'
+  parent: entity.user.collection
+  weight: 99
+  menu_name: admin_menu
