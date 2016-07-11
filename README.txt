@@ -15,20 +15,20 @@ have exceeded configurable periods of inactivity:
      be sent to the user and/or site administrator when the action occurs)
   - optionally prevent deletion of user that have created site content
 
-All events triggered by this module are logged via the watchdog.
+All events triggered by this module are logged via the watchdog (logger in Drupal 8.x).
 
 
 Installation and configuration:
 ------------------------------
-Enable the module at Administer->Site Building->Modules.
+Enable the module at Administer->Extend.
 Database tables will be automatically created.
-Grant the 'change inactive user settings' permission to the appropriate roles.
-Configure as desired at Administer->User configuration->Inactive users.
+Grant the 'Inactive User configuration access' permission to the appropriate roles.
+Configure as desired at Administer->People->Inactive users.
 
 
 Requires:
 --------
- - Drupal 6.x
+ - Drupal 8.x
  - Working crontab
 
 
@@ -38,4 +38,5 @@ Credits:
  - Converted to 4.7 by Dries Knapen <drieske@hotmail.com>
  - Converted to 5.0 by Adam Cowell <adam.cowell@gmail.com> and Larry Garfield <larry@garfieldtech.com>
  - Converted to 6.x by Tim Lievens and David Norman <http://deekayen.net>
+ - Converted to 8.x by Romantsov Aleksey <https://www.drupal.org/user/3468239>
  - Currently maintained by Larry Garfield <larry@garfieldtech.com> and David Norman <http://deekayen.net>
